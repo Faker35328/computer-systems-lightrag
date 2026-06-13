@@ -1,0 +1,2 @@
+HKUDS-LightRAG/data/rag_storage/course_qwen36_plus_qwen3emb06b_courseware_v1/*.json filter=lfs diff=lfs merge=lfs -text
+HKUDS-LightRAG/data/rag_storage/course_qwen36_plus_qwen3emb06b_courseware_v1/*.graphml filter=lfs diff=lfs merge=lfs -text

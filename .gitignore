@@ -1,0 +1,76 @@
+# Secrets and local config
+.env
+*.env
+!.env.example
+HKUDS-LightRAG/.env
+HKUDS-LightRAG/config.ini
+*.key
+*.pem
+
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Logs and temporary files
+*.log
+*.tmp
+tmp/
+.tmp/
+.tmp-mineru/
+mineru/
+
+# Model caches and large local caches
+.hf-cache/
+**/hf-cache/
+**/.cache/
+
+# Raw course materials and generated intermediate artifacts
+知识库/
+*.pdf
+mineru_output/
+processed_markdown/
+processed_markdown_v2/
+processed_textbook_sections/
+processed_manual_sections/
+output/
+
+# LightRAG runtime data: keep only the final v1 workspace.
+HKUDS-LightRAG/data/*
+!HKUDS-LightRAG/data/
+!HKUDS-LightRAG/data/rag_storage/
+HKUDS-LightRAG/data/rag_storage/*
+!HKUDS-LightRAG/data/rag_storage/course_qwen36_plus_qwen3emb06b_courseware_v1/
+!HKUDS-LightRAG/data/rag_storage/course_qwen36_plus_qwen3emb06b_courseware_v1/**
+
+# Nested repository metadata should not be committed by the outer repo.
+HKUDS-LightRAG/.git/
+HKUDS-LightRAG/.git_backup/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+HKUDS-LightRAG/dist/
+HKUDS-LightRAG/build/
+HKUDS-LightRAG/*.egg-info/
+
+# Optional LightRAG deployment variants not used by this project.
+HKUDS-LightRAG/k8s-deploy/
+HKUDS-LightRAG/docker-compose-full.yml
+HKUDS-LightRAG/docker-compose.podman.yml
+HKUDS-LightRAG/env.docker-compose-full
