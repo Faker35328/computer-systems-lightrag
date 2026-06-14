@@ -10,6 +10,8 @@
 - LLM: `qwen3.7-plus`
 - Embedding: 本地 vLLM `Qwen/Qwen3-Embedding-0.6B`
 - Embedding 服务: `http://localhost:8001/v1`
+- Reranker: 本地 vLLM `BAAI/bge-reranker-v2-m3`
+- Reranker 服务: `http://localhost:8000/rerank`
 - 向量维度: `1024`
 - 切分策略: `recursive_character`
 - 存储: LightRAG 默认本地存储，`NanoVectorDBStorage` + `NetworkXStorage`
@@ -35,12 +37,46 @@
 - 宿主机地址: `http://localhost:8001/v1`
 - 模型: `Qwen/Qwen3-Embedding-0.6B`
 - 维度: `1024`
-- 上下文长度: `32768`
+- 当前服务上下文长度: `8192`
 - Hugging Face 缓存目录: `HKUDS-LightRAG/data/hf-cache`
 
 LightRAG 通过 Docker 网络访问 `vllm-embed:8001`，宿主机和调试脚本通过 `localhost:8001` 访问。
 
-### 3. LLM 切换到 qwen3.7-plus
+### 3. 本地 reranker 重排序模型
+
+新增 vLLM rerank 服务，负责提供 Cohere-compatible `/rerank` 接口：
+
+- 容器服务名: `vllm-rerank`
+- 容器内地址: `http://vllm-rerank:8000/rerank`
+- 宿主机地址: `http://localhost:8000/rerank`
+- 模型: `BAAI/bge-reranker-v2-m3`
+- 默认策略: 服务常驻，但 `RERANK_BY_DEFAULT=false`
+
+也就是说，普通查询默认不重排序；需要评测或处理歧义问题时，在请求中显式传入：
+
+```json
+{
+  "query": "空间局部性是什么？",
+  "mode": "mix",
+  "enable_rerank": true
+}
+```
+
+8GB 显卡下采用保守显存分配，并把两个 vLLM 服务的 `--max-model-len` 都控制在 `8192`：
+
+```text
+vllm-embed   gpu-memory-utilization = 0.43
+vllm-rerank  gpu-memory-utilization = 0.38
+```
+
+当前已完成验证：
+
+- `http://localhost:8000/rerank` 可正常返回排序分数。
+- 示例问题 `空间局部性是什么？` 中，相关文本得分约 `0.9985`，不相关文本得分约 `0.00017`。
+- LightRAG `/health` 已显示 `rerank_binding=cohere`、`rerank_model=BAAI/bge-reranker-v2-m3`。
+- `/query/data` 使用 `enable_rerank=true` 时，LightRAG 日志中出现 `Successfully reranked: 8 chunks from 44 original chunks`，说明不是只启动了容器，而是已经实际参与检索排序。
+
+### 4. LLM 切换到 qwen3.7-plus
 
 实体关系抽取、关键词抽取、最终回答生成使用 `qwen3.7-plus`。为了保证实体关系抽取的结构稳定性，配置中关闭了思考模式：
 
@@ -48,7 +84,7 @@ LightRAG 通过 Docker 网络访问 `vllm-embed:8001`，宿主机和调试脚本
 OPENAI_LLM_EXTRA_BODY='{"enable_thinking": false}'
 ```
 
-### 4. 递归字符切分策略
+### 5. 递归字符切分策略
 
 已对 LightRAG 增加可配置切分策略：
 
@@ -74,7 +110,7 @@ Markdown 标题 -> 空行/段落 -> 换行 -> 中文句末标点 -> 英文句末
 
 > 已经入库的旧 chunk 不会自动变化。该策略只影响后续上传的新文档。
 
-### 5. 课件 PDF 处理链路
+### 6. 课件 PDF 处理链路
 
 课件处理方式：
 
@@ -105,7 +141,7 @@ Markdown 标题 -> 空行/段落 -> 换行 -> 中文句末标点 -> 英文句末
 
 这样回答中的 References 可以回溯到原始 PDF 的具体页码。
 
-### 6. 教材小节处理链路
+### 7. 教材小节处理链路
 
 教材处理方式：
 
@@ -139,7 +175,7 @@ CSAPP 整本 PDF
 CSAPP 3e: Chapter 6 The Memory Hierarchy - 6.2 Locality (pp. 640-644)
 ```
 
-### 7. i386 手册处理链路
+### 8. i386 手册处理链路
 
 手册处理方式：
 
@@ -159,7 +195,7 @@ i386 手册 / Errata
 - 过短跳过: `26`
 - 上传错误: `0`
 
-### 8. 检索阶段可观测
+### 9. 检索阶段可观测
 
 可以通过 `/query/data` 查看 LightRAG 的检索阶段结果，而不是只看最终生成答案。返回内容包括：
 
@@ -181,7 +217,7 @@ i386 手册 / Errata
 
 然后系统会分别检索文本块、实体和关系，再合并上下文交给 LLM 生成答案。
 
-### 9. 课程 JSON 关键词增强
+### 10. 课程 JSON 关键词增强
 
 系统已经把课程知识骨架接入 LightRAG Server 的原生关键词检索链路。它不会改写用户原始问题，而是在 LightRAG 自己抽取 `high_level / low_level` 关键词之后，用 `计算机系统基础1.json` 和 `计算机系统基础2.json` 做一次课程节点定位和关键词补强。
 
@@ -275,7 +311,7 @@ EMBEDDING_BINDING_HOST=http://vllm-embed:8001/v1
 EMBEDDING_BINDING_API_KEY=local-key
 EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B
 EMBEDDING_DIM=1024
-EMBEDDING_TOKEN_LIMIT=32768
+EMBEDDING_TOKEN_LIMIT=8192
 EMBEDDING_SEND_DIM=false
 EMBEDDING_USE_BASE64=false
 EMBEDDING_FUNC_MAX_ASYNC=1
@@ -283,6 +319,15 @@ EMBEDDING_FUNC_MAX_ASYNC=1
 EMBEDDING_ASYMMETRIC=true
 EMBEDDING_QUERY_PREFIX="Instruct: Given a Computer Systems course learning question, retrieve relevant textbook or lecture passages that answer the question.\nQuery: "
 EMBEDDING_DOCUMENT_PREFIX=NO_PREFIX
+
+RERANK_BINDING=cohere
+RERANK_MODEL=BAAI/bge-reranker-v2-m3
+RERANK_BINDING_HOST=http://vllm-rerank:8000/rerank
+RERANK_BINDING_API_KEY=local-key
+RERANK_BY_DEFAULT=false
+MIN_RERANK_SCORE=0.0
+RERANK_ENABLE_CHUNKING=true
+RERANK_MAX_TOKENS_PER_DOC=2048
 
 CHUNKING_STRATEGY=recursive_character
 CHUNK_SIZE=1200
@@ -301,12 +346,12 @@ MAX_PARALLEL_INSERT=3
 
 不要把真实的阿里云 API Key 写进 README 或提交到 Git。
 
-### 2. 启动 vLLM embedding 和 LightRAG
+### 2. 启动 vLLM embedding / reranker 和 LightRAG
 
 ```powershell
 cd D:\work-space\light-RAG\HKUDS-LightRAG
 
-docker compose -f docker-compose.yml -f docker-compose.embedding.yml up -d vllm-embed
+docker compose -f docker-compose.yml -f docker-compose.embedding.yml up -d vllm-embed vllm-rerank
 docker compose -f docker-compose.yml -f docker-compose.embedding.yml up -d lightrag
 ```
 
@@ -316,6 +361,7 @@ docker compose -f docker-compose.yml -f docker-compose.embedding.yml up -d light
 
 ```powershell
 Invoke-RestMethod -Uri "http://localhost:8001/v1/models"
+Invoke-RestMethod -Uri "http://localhost:8000/v1/models"
 ```
 
 验证 LightRAG：
@@ -517,6 +563,18 @@ POST http://localhost:9621/query/data
 }
 ```
 
+默认情况下 `RERANK_BY_DEFAULT=false`，这类请求不会启用重排序。需要单次开启本地 BGE Reranker 时，显式加入：
+
+```json
+{
+  "query": "空间局部性是什么？",
+  "mode": "mix",
+  "top_k": 10,
+  "chunk_top_k": 10,
+  "enable_rerank": true
+}
+```
+
 这个接口适合调试“检索到了什么”，返回通常包括：
 
 ```text
@@ -678,6 +736,7 @@ def course_rag_context(question: str) -> str:
  -> 用 high_level 关键词检索 relationships_vdb / 全局主题关系
  -> 合并文本块、实体、关系
  -> 去重并按 max_entity_tokens / max_relation_tokens / max_total_tokens 截断
+ -> 如果 enable_rerank=true，调用 BGE Reranker 对候选 chunks 重排序
  -> 组装成最终上下文
  -> qwen3.7-plus 基于上下文生成答案
  -> 返回答案和 References
@@ -883,6 +942,128 @@ max_total_tokens
 
 这表示系统先从图谱和文本检索中收集到更多候选 chunks，合并去重后，最后保留了 8 个 chunks 进入最终上下文。
 
+如果请求体中设置了 `enable_rerank=true`，则会在候选 chunks 进入最终上下文之前调用本地 BGE Reranker：
+
+```json
+{
+  "query": "空间局部性是什么？",
+  "mode": "mix",
+  "top_k": 8,
+  "chunk_top_k": 8,
+  "enable_rerank": true
+}
+```
+
+重排序阶段使用的是：
+
+```text
+model = BAAI/bge-reranker-v2-m3
+endpoint = http://vllm-rerank:8000/rerank
+```
+
+它会对候选 chunks 计算“问题-文档”相关性分数，并按分数重新排序。实际验证时，LightRAG 日志出现过：
+
+```text
+Successfully reranked: 8 chunks from 44 original chunks
+```
+
+这表示系统先从文本向量、实体邻域、关系检索中收集并合并出 44 个候选 chunks，然后由 BGE Reranker 重新打分排序，最后保留 8 个进入最终上下文。
+
+重排序阶段可以理解成下面这个中间过程。
+
+进入 reranker 前，LightRAG 已经准备好一批候选文本块，结构上类似：
+
+```json
+{
+  "query": "空间局部性是什么？",
+  "candidate_chunks": [
+    {
+      "source": "计算机系统基础1：13. 存储器层次结构.pdf 第 57 页",
+      "content_preview": "局部性原理；时间局部性；空间局部性..."
+    },
+    {
+      "source": "CSAPP 3e: Chapter 6 The Memory Hierarchy - 6.2 Locality (p. 640)",
+      "content_preview": "Programs tend to use data and instructions with addresses near or equal to those they have used recently..."
+    },
+    {
+      "source": "CSAPP 3e: Chapter 6 The Memory Hierarchy - 6.6.2 Rearranging Loops to Increase Spatial Locality (pp. 679-682)",
+      "content_preview": "Rearranging loops can improve spatial locality in matrix multiplication..."
+    },
+    {
+      "source": "计算机系统基础1：14. 高速缓存.pdf 第 24 页",
+      "content_preview": "缓存友好代码、步长为 1 的访问、数组连续访问..."
+    }
+  ]
+}
+```
+
+LightRAG 内部会把这些候选内容转换成 Cohere-compatible rerank 请求，发送给容器内服务：
+
+```http
+POST http://vllm-rerank:8000/rerank
+```
+
+请求体逻辑上类似：
+
+```json
+{
+  "model": "BAAI/bge-reranker-v2-m3",
+  "query": "空间局部性是什么？",
+  "documents": [
+    "来源：计算机系统基础1：13. 存储器层次结构.pdf 第 57 页\n局部性原理；时间局部性；空间局部性...",
+    "来源：CSAPP 3e: Chapter 6 The Memory Hierarchy - 6.2 Locality (p. 640)\nPrograms tend to use data and instructions...",
+    "来源：CSAPP 3e: Chapter 6 The Memory Hierarchy - 6.6.2 Rearranging Loops to Increase Spatial Locality (pp. 679-682)\nRearranging loops can improve spatial locality...",
+    "来源：计算机系统基础1：14. 高速缓存.pdf 第 24 页\n缓存友好代码、步长为 1 的访问、数组连续访问..."
+  ],
+  "top_n": 8
+}
+```
+
+`/rerank` 的返回会带每个候选文档的 `index` 和 `relevance_score`。为了验证模型本身是否会区分相关和不相关内容，单独测试过一个最小例子：
+
+```json
+{
+  "query": "空间局部性是什么？",
+  "documents": [
+    "空间局部性是程序倾向于访问相邻内存地址。",
+    "网络套接字用于进程间通信。"
+  ]
+}
+```
+
+返回的核心结果是：
+
+```json
+{
+  "results": [
+    {
+      "index": 0,
+      "relevance_score": 0.9985
+    },
+    {
+      "index": 1,
+      "relevance_score": 0.00017
+    }
+  ]
+}
+```
+
+这说明 BGE Reranker 会把与“空间局部性”直接相关的文档排到前面，把明显不相关的“网络套接字”压到后面。
+
+在 LightRAG 的 `/query/data` 结果中，最终可以看到重排后的 `data.chunks` 和 `data.references` 顺序。一次开启 `enable_rerank=true` 的实测中，最终进入上下文的前几条来源类似：
+
+```text
+1. 计算机系统基础1：14. 高速缓存.pdf 第 24 页
+2. 计算机系统基础1：13. 存储器层次结构.pdf 第 57 页
+3. 计算机系统基础1：13. 存储器层次结构.pdf 第 68 页
+4. CSAPP 3e: Chapter 6 The Memory Hierarchy - 6.5 Writing Cache-Friendly Code (pp. 669-672)
+5. 计算机系统基础1：13. 存储器层次结构.pdf 第 58 页
+```
+
+注意：当前 `/query/data` 主要展示重排后的 chunks 和 references，不一定直接暴露每条 chunk 的 `rerank_score`。如果要看分数，可以直接调用 `http://localhost:8000/rerank` 做小规模验证；如果要看 LightRAG 是否调用成功，则查看容器日志中的 `Successfully reranked...`。
+
+如果 `enable_rerank=false` 或不传该字段，则跳过这一步，仍使用 LightRAG 原本的向量相似度、图谱关联和内部合并排序。
+
 ### 7. 组装上下文并生成答案
 
 最终上下文通常包含：
@@ -917,11 +1098,22 @@ Reference Document List
 
 这些 References 来自上传文档时写入的 `file_source`。课件是按页上传，所以可以回溯到“某个 PDF 第几页”；教材是按小节上传，所以可以回溯到“Chapter / 小节 / 页码范围”。
 
-当前没有接入重排序模型。可以在 `/health` 中确认：
+当前已经配置本地 BGE Reranker，但默认不自动启用。可以在 `/health` 中确认 rerank provider 是否可用：
 
 ```text
-enable_rerank = false
-rerank_binding = null
+enable_rerank = true
+rerank_binding = cohere
+rerank_model = BAAI/bge-reranker-v2-m3
 ```
 
-因此当前排序主要来自 LightRAG 的向量相似度、图谱关联和内部合并逻辑，而不是独立 reranker。
+是否真正对某次查询启用重排序，由请求体中的 `enable_rerank` 控制：
+
+```json
+{
+  "query": "空间局部性是什么？",
+  "mode": "mix",
+  "enable_rerank": true
+}
+```
+
+如果不传该字段或传 `false`，排序主要来自 LightRAG 的向量相似度、图谱关联和内部合并逻辑；传 `true` 时，会在候选 chunks 上额外调用 BGE Reranker 重新排序。
