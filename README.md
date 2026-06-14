@@ -181,6 +181,40 @@ i386 手册 / Errata
 
 然后系统会分别检索文本块、实体和关系，再合并上下文交给 LLM 生成答案。
 
+### 9. 课程 JSON 关键词增强
+
+系统已经把课程知识骨架接入 LightRAG Server 的原生关键词检索链路。它不会改写用户原始问题，而是在 LightRAG 自己抽取 `high_level / low_level` 关键词之后，用 `计算机系统基础1.json` 和 `计算机系统基础2.json` 做一次课程节点定位和关键词补强。
+
+当前流程：
+
+```text
+WebUI / LangChain Agent
+ -> LightRAG Server /query
+ -> LightRAG 原生 LLM 抽取 high_level / low_level 关键词
+ -> 课程 JSON 本地召回候选课程节点
+ -> qwen3.7-plus 从候选节点中精选相关节点
+ -> 融合课程关键词
+ -> LightRAG 原检索流程
+ -> 返回答案和 References
+```
+
+课程骨架文件位置：
+
+```text
+HKUDS-LightRAG/course_outlines/计算机系统基础1.json
+HKUDS-LightRAG/course_outlines/计算机系统基础2.json
+```
+
+如果请求显式传入 `hl_keywords` 或 `ll_keywords`，系统会尊重调用方传入的关键词，不再执行课程 JSON 增强。这保留了 LightRAG 原本预留的手动关键词接口语义。
+
+`/query/data` 会额外返回调试字段：
+
+```text
+metadata.course_outline_enhancer
+```
+
+普通 `/query` 和 WebUI 最终回答不会显示这个调试字段。
+
 ## 目录说明
 
 ```text
@@ -189,6 +223,7 @@ i386 手册 / Errata
 │  ├─ .env                                 # 本地环境变量，包含密钥，不要提交
 │  ├─ docker-compose.yml
 │  ├─ docker-compose.embedding.yml         # vLLM embedding 增量 compose
+│  ├─ course_outlines/                     # 课程 JSON 骨架，用于查询阶段关键词增强
 │  └─ data/hf-cache/                       # Hugging Face 模型缓存
 ├─ 知识库/                                  # 原始课程 PDF
 ├─ mineru_output/                          # MinerU 解析输出
@@ -252,6 +287,13 @@ EMBEDDING_DOCUMENT_PREFIX=NO_PREFIX
 CHUNKING_STRATEGY=recursive_character
 CHUNK_SIZE=1200
 CHUNK_OVERLAP_SIZE=100
+
+ENABLE_COURSE_KEYWORD_ENHANCER=true
+COURSE_OUTLINE_FILES=/app/course_outlines/计算机系统基础1.json,/app/course_outlines/计算机系统基础2.json
+COURSE_OUTLINE_SELECTOR=llm
+COURSE_OUTLINE_CANDIDATE_K=20
+COURSE_OUTLINE_SELECTED_K=3
+COURSE_OUTLINE_SKIP_IF_KEYWORDS=true
 
 MAX_ASYNC=8
 MAX_PARALLEL_INSERT=3
@@ -483,8 +525,11 @@ data.relationships
 data.chunks
 data.references
 metadata.keywords
+metadata.course_outline_enhancer
 metadata.processing_info
 ```
+
+其中 `metadata.keywords` 是最终用于检索的融合关键词；`metadata.course_outline_enhancer` 用于调试课程 JSON 命中的节点和补充关键词。
 
 ### 6. 查看交给 LLM 的上下文
 
@@ -620,19 +665,257 @@ def course_rag_context(question: str) -> str:
 
 ## LightRAG 检索流程说明
 
-以问题“空间局部性”为例，LightRAG 的大致流程是：
+以问题“空间局部性是什么？”为例，可以把一次完整查询理解成下面这条链路：
 
 ```text
 用户问题
- -> LLM 抽取 high_level / low_level 关键词
- -> 原问题加 query prefix 后转向量
- -> low_level 关键词用于实体/关系和低层检索
- -> high_level 关键词用于高层主题检索
- -> 检索 chunks_vdb / entities_vdb / relationships_vdb
- -> 合并去重并按 token budget 截断
- -> 整理成上下文
- -> qwen3.7-plus 生成最终答案
+ -> /query 或 /query/data
+ -> qwen3.7-plus 抽取 high_level / low_level 关键词
+ -> 课程 JSON 骨架定位课程节点并补充关键词
+ -> 原问题加 embedding query prefix 后转成 1024 维向量
+ -> 检索 chunks_vdb 得到语义相似文本块
+ -> 用 low_level 关键词检索 entities_vdb / 本地图谱邻域
+ -> 用 high_level 关键词检索 relationships_vdb / 全局主题关系
+ -> 合并文本块、实体、关系
+ -> 去重并按 max_entity_tokens / max_relation_tokens / max_total_tokens 截断
+ -> 组装成最终上下文
+ -> qwen3.7-plus 基于上下文生成答案
+ -> 返回答案和 References
 ```
+
+### 1. 输入问题
+
+```text
+空间局部性是什么？
+```
+
+如果调用 `/query/data`，请求体可以类似：
+
+```json
+{
+  "query": "空间局部性是什么？",
+  "mode": "mix",
+  "top_k": 8,
+  "chunk_top_k": 8,
+  "max_entity_tokens": 6000,
+  "max_relation_tokens": 8000,
+  "max_total_tokens": 30000,
+  "enable_rerank": false
+}
+```
+
+### 2. LightRAG 原生关键词抽取
+
+LightRAG 会先调用当前 LLM 从问题中抽取两类关键词：
+
+- `high_level`: 更偏主题、概念、领域层面的关键词，主要用于全局关系和主题检索。
+- `low_level`: 更偏具体实体、术语、细节层面的关键词，主要用于实体和局部检索。
+
+本例中原始关键词为：
+
+```json
+{
+  "high_level": ["空间局部性", "计算机体系结构", "内存访问模式"],
+  "low_level": ["缓存", "数据块", "邻近数据"]
+}
+```
+
+### 3. 课程 JSON 骨架增强
+
+随后 Server 会读取：
+
+```text
+HKUDS-LightRAG/course_outlines/计算机系统基础1.json
+HKUDS-LightRAG/course_outlines/计算机系统基础2.json
+```
+
+内部会先把课程树展平成很多课程路径节点，例如：
+
+```text
+计算机系统基础1 > 存储器层次结构 > 局部性原理 > 空间局部性
+```
+
+增强器会使用“原始问题 + 原始 high_level / low_level 关键词”做本地候选召回，再让 `qwen3.7-plus` 从候选中精选最相关节点。本例中命中的课程节点是：
+
+```text
+计算机系统基础1 > 存储器层次结构 > 局部性原理 > 空间局部性
+计算机系统基础1 > 存储器层次结构 > 编写高速缓存友好代码 > 举例：矩阵乘法 > 重排循环顺序实现更好的空间局部性
+```
+
+然后从命中节点的路径、兄弟节点、子节点中补充课程关键词。融合后的最终关键词为：
+
+```json
+{
+  "high_level": [
+    "空间局部性",
+    "计算机体系结构",
+    "内存访问模式",
+    "存储器层次结构",
+    "局部性原理",
+    "编写高速缓存友好代码",
+    "举例：矩阵乘法",
+    "重排循环顺序实现更好的空间局部性"
+  ],
+  "low_level": [
+    "缓存",
+    "数据块",
+    "邻近数据",
+    "时间局部性",
+    "矩阵分块实现更好的时间局部性"
+  ]
+}
+```
+
+这个调试信息可以从 `/query/data` 的下面字段看到：
+
+```text
+metadata.keywords
+metadata.course_outline_enhancer
+```
+
+如果调用方显式传入 `hl_keywords` 或 `ll_keywords`，课程增强器会跳过，系统直接使用调用方传入的关键词。
+
+### 4. 原问题向量检索文本块
+
+文本块检索仍然使用原始问题，而不是改写后的问题。因为当前使用 Qwen3 Embedding 的 instruction-aware retrieval，查询侧会自动加上 query prefix：
+
+```text
+Instruct: Given a Computer Systems course learning question, retrieve relevant textbook or lecture passages that answer the question.
+Query: 空间局部性是什么？
+```
+
+这段文本会被本地 vLLM 的 `Qwen/Qwen3-Embedding-0.6B` 转成 `1024` 维向量，然后去 `chunks_vdb` 里找语义最相似的课件/教材/手册文本块。
+
+本例中 `/query/data` 返回的文本块示例：
+
+```text
+chunk 1:
+来源：计算机系统基础1：13. 存储器层次结构.pdf 第 57 页
+内容预览：局部性原理：程序倾向于使用最近访问过的数据和指令，或是与之临近的数据和指令...
+
+chunk 2:
+来源：CSAPP 3e: Chapter 6 The Memory Hierarchy - 6.6.2 Rearranging Loops to Increase Spatial Locality (pp. 679-682)
+内容预览：A matrix multiply function is usually implemented using three nested loops...
+
+chunk 3:
+来源：计算机系统基础1：13. 存储器层次结构.pdf 第 68 页
+内容预览：局部性特征如何导致缓存命中 How locality induces cache hits...
+```
+
+### 5. 关键词驱动的图谱检索
+
+除了直接查文本块，LightRAG 还会用关键词查图谱：
+
+```text
+low_level keywords
+ -> entities_vdb
+ -> 找到相关实体及其邻域关系
+
+high_level keywords
+ -> relationships_vdb
+ -> 找到主题层面的相关关系
+```
+
+本例 `/query/data` 的统计信息：
+
+```json
+{
+  "entities": 17,
+  "relationships": 91,
+  "chunks": 8,
+  "references": 8
+}
+```
+
+命中的实体示例：
+
+```json
+{
+  "entity_name": "空间局部性",
+  "entity_type": "concept",
+  "description": "空间局部性（Spatial Locality）是计算机体系结构中局部性原理的一种重要形式，主要描述了程序在访问内存时的一种特定行为模式...",
+  "file_path": "计算机系统基础1：13. 存储器层次结构.pdf 第 57 页<SEP>计算机系统基础1：13. 存储器层次结构.pdf 第 58 页..."
+}
+```
+
+命中的关系示例：
+
+```json
+{
+  "src_id": "空间局部性",
+  "tgt_id": "高速缓存",
+  "description": "空间局部性是利用高速缓存提高性能的重要原理之一，强调步长为1的存储器访问模式。",
+  "keywords": "工作原理,缓存优化",
+  "file_path": "计算机系统基础1：14. 高速缓存.pdf 第 20 页"
+}
+```
+
+### 6. 合并、去重和 token budget 截断
+
+LightRAG 会把三路召回结果合并：
+
+```text
+文本块召回结果
++ 实体召回结果
++ 关系召回结果
+```
+
+然后按配置中的 token budget 控制最终上下文大小：
+
+```text
+max_entity_tokens
+max_relation_tokens
+max_total_tokens
+```
+
+本例的处理统计：
+
+```json
+{
+  "total_entities_found": 17,
+  "total_relations_found": 91,
+  "entities_after_truncation": 17,
+  "relations_after_truncation": 91,
+  "merged_chunks_count": 44,
+  "final_chunks_count": 8
+}
+```
+
+这表示系统先从图谱和文本检索中收集到更多候选 chunks，合并去重后，最后保留了 8 个 chunks 进入最终上下文。
+
+### 7. 组装上下文并生成答案
+
+最终上下文通常包含：
+
+```text
+Knowledge Graph Data
+Entity
+Relationship
+Document Chunks
+Reference Document List
+```
+
+然后 `qwen3.7-plus` 基于这个上下文生成回答。普通 `/query` 只返回答案和 References；`/query/data` 会返回检索阶段中间产物，适合调试。
+
+本例最终答案会引用课件和教材来源，例如：
+
+```text
+空间局部性（Spatial Locality）是计算机体系结构中局部性原理的一种核心形式，主要描述了程序在访问内存时倾向于集中访问邻近地址的数据或指令的行为模式...
+```
+
+### 8. References 示例
+
+该问题的 `/query/data` Top References 示例：
+
+```text
+1. 计算机系统基础1：13. 存储器层次结构.pdf 第 57 页
+2. CSAPP 3e: Chapter 6 The Memory Hierarchy - 6.6.2 Rearranging Loops to Increase Spatial Locality (pp. 679-682)
+3. 计算机系统基础1：13. 存储器层次结构.pdf 第 68 页
+4. CSAPP 3e: Chapter 6 The Memory Hierarchy - 6.4.5 Issues with Writes (pp. 666-667)
+5. CSAPP 3e: Chapter 6 The Memory Hierarchy - 6.2 Locality (p. 640)
+```
+
+这些 References 来自上传文档时写入的 `file_source`。课件是按页上传，所以可以回溯到“某个 PDF 第几页”；教材是按小节上传，所以可以回溯到“Chapter / 小节 / 页码范围”。
 
 当前没有接入重排序模型。可以在 `/health` 中确认：
 

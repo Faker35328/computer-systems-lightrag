@@ -9,8 +9,11 @@ services:
     ports:
       - "${HOST:-0.0.0.0}:${PORT:-9621}:9621"
     volumes:
+      - ./lightrag/operate.py:/app/lightrag/operate.py:ro
+      - ./lightrag/course_keyword_enhancer.py:/app/lightrag/course_keyword_enhancer.py:ro
       - ./data/rag_storage:/app/data/rag_storage
       - ./data/inputs:/app/data/inputs
+      - ./course_outlines:/app/course_outlines:ro
       - ./config.ini:/app/config.ini
       - ./.env:/app/.env
     deploy:
@@ -24,3 +27,4 @@ services:
       INPUT_DIR: "/app/data/inputs"
       HOST: "0.0.0.0"
       PORT: "9621"
+      PYTHONDONTWRITEBYTECODE: "1"

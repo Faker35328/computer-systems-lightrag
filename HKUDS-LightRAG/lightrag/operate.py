@@ -52,6 +52,7 @@ from lightrag.base import (
     QueryResult,
     QueryContextResult,
 )
+from lightrag.course_keyword_enhancer import get_course_keyword_enhancer
 from lightrag.prompt import PROMPTS
 from lightrag.constants import (
     GRAPH_FIELD_SEP,
@@ -3640,6 +3641,17 @@ async def get_keywords_from_query(
     hl_keywords, ll_keywords = await extract_keywords_only(
         query, query_param, global_config, hashing_kv
     )
+    hl_keywords, ll_keywords, enhancer_metadata = (
+        await get_course_keyword_enhancer().enhance(
+            query,
+            hl_keywords,
+            ll_keywords,
+            query_param,
+            global_config,
+        )
+    )
+    if enhancer_metadata:
+        setattr(query_param, "_course_outline_enhancer", enhancer_metadata)
     return hl_keywords, ll_keywords
 
 
@@ -4573,6 +4585,9 @@ async def _build_query_context(
         "high_level": hl_keywords_list,
         "low_level": ll_keywords_list,
     }
+    course_outline_metadata = getattr(query_param, "_course_outline_enhancer", None)
+    if course_outline_metadata:
+        raw_data["metadata"]["course_outline_enhancer"] = course_outline_metadata
     raw_data["metadata"]["processing_info"] = {
         "total_entities_found": len(search_result.get("final_entities", [])),
         "total_relations_found": len(search_result.get("final_relations", [])),
