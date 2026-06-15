@@ -11,26 +11,28 @@ from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.utils import logger
 from pydantic import BaseModel, Field, field_validator
 
+router = APIRouter(tags=["query"])
 
-REFERENCE_HEADING_RE = re.compile(
-    r"(?im)^\s{0,3}(?:#{1,6}\s*)?references\s*:?\s*$"
-)
+REFERENCE_HEADING_RE = re.compile(r"(?im)^\s{0,3}(?:#{1,6}\s*)?references\s*:?\s*$")
 CITATION_RE = re.compile(r"\[(\d+)\]")
+
+
+def _reference_id(value: Any) -> str:
+    return str(value or "").strip().strip("[]")
 
 
 def _sync_response_references(
     response_content: str, references: List[Dict[str, Any]]
 ) -> tuple[str, List[Dict[str, Any]]]:
-    """Keep final References aligned with citation ids used in the answer body."""
+    """Keep the final References section aligned with citations used in the answer."""
     if not response_content or not references:
         return response_content, references
 
-    match = REFERENCE_HEADING_RE.search(response_content)
-    answer_body = response_content[: match.start()] if match else response_content
-
+    answer_body = REFERENCE_HEADING_RE.split(response_content, maxsplit=1)[0].rstrip()
     used_ids: list[str] = []
     seen: set[str] = set()
-    for ref_id in CITATION_RE.findall(answer_body):
+    for match in CITATION_RE.finditer(answer_body):
+        ref_id = match.group(1)
         if ref_id not in seen:
             used_ids.append(ref_id)
             seen.add(ref_id)
@@ -38,25 +40,48 @@ def _sync_response_references(
     if not used_ids:
         return response_content, references
 
-    references_by_id = {
-        str(ref.get("reference_id", "")): ref
-        for ref in references
-        if ref.get("reference_id")
+    refs_by_id = {
+        _reference_id(ref.get("reference_id") or index + 1): ref
+        for index, ref in enumerate(references)
     }
-    filtered_references = [
-        references_by_id[ref_id] for ref_id in used_ids if ref_id in references_by_id
-    ]
-    if not filtered_references:
+    selected_refs = [refs_by_id[ref_id] for ref_id in used_ids if ref_id in refs_by_id]
+
+    if not selected_refs:
         return response_content, references
 
-    reference_lines = [
-        f"* [{ref['reference_id']}] {ref.get('file_path', '')}"
-        for ref in filtered_references
-    ]
-    synced_response = (
-        answer_body.rstrip() + "\n\n### References\n" + "\n".join(reference_lines)
-    )
-    return synced_response, filtered_references
+    reference_lines = ["", "", "### References"]
+    for ref in selected_refs:
+        ref_id = _reference_id(ref.get("reference_id"))
+        source = (
+            ref.get("file_path")
+            or ref.get("source")
+            or ref.get("document")
+            or ref.get("doc_id")
+            or ""
+        )
+        reference_lines.append(f"- [{ref_id}] {source}".rstrip())
+
+    return answer_body + "\n".join(reference_lines), selected_refs
+
+
+def _enrich_references_with_chunks(
+    references: List[Dict[str, Any]], chunks: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    ref_id_to_content: dict[str, list[str]] = {}
+    for chunk in chunks:
+        ref_id = _reference_id(chunk.get("reference_id"))
+        content = chunk.get("content", "")
+        if ref_id and content:
+            ref_id_to_content.setdefault(ref_id, []).append(content)
+
+    enriched_references = []
+    for ref in references:
+        ref_copy = ref.copy()
+        ref_id = _reference_id(ref.get("reference_id"))
+        if ref_id in ref_id_to_content:
+            ref_copy["content"] = ref_id_to_content[ref_id]
+        enriched_references.append(ref_copy)
+    return enriched_references
 
 
 class QueryRequest(BaseModel):
@@ -237,12 +262,6 @@ class StreamChunkResponse(BaseModel):
 
 
 def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
-    # Fresh router per call. A module-level instance would accumulate
-    # duplicate routes when the factory is invoked more than once in the
-    # same process (e.g. across tests), which triggers FastAPI's
-    # "Duplicate Operation ID" warnings.
-    router = APIRouter(tags=["query"])
-
     combined_auth = get_combined_auth_dependency(api_key)
 
     @router.post(
@@ -473,32 +492,16 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             if not response_content:
                 response_content = "No relevant context found for the query."
 
-            response_content, references = _sync_response_references(
-                response_content, references
-            )
+            if request.include_references:
+                response_content, references = _sync_response_references(
+                    response_content, references
+                )
 
             # Enrich references with chunk content if requested
             if request.include_references and request.include_chunk_content:
-                chunks = data.get("chunks", [])
-                # Create a mapping from reference_id to chunk content
-                ref_id_to_content = {}
-                for chunk in chunks:
-                    ref_id = chunk.get("reference_id", "")
-                    content = chunk.get("content", "")
-                    if ref_id and content:
-                        # Collect chunk content; join later to avoid quadratic string concatenation
-                        ref_id_to_content.setdefault(ref_id, []).append(content)
-
-                # Add content to references
-                enriched_references = []
-                for ref in references:
-                    ref_copy = ref.copy()
-                    ref_id = ref.get("reference_id", "")
-                    if ref_id in ref_id_to_content:
-                        # Keep content as a list of chunks (one file may have multiple chunks)
-                        ref_copy["content"] = ref_id_to_content[ref_id]
-                    enriched_references.append(ref_copy)
-                references = enriched_references
+                references = _enrich_references_with_chunks(
+                    references, data.get("chunks", [])
+                )
 
             # Return response with or without references based on request
             if request.include_references:
@@ -733,47 +736,37 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 # Enrich references with chunk content if requested
                 if request.include_references and request.include_chunk_content:
                     data = result.get("data", {})
-                    chunks = data.get("chunks", [])
-                    # Create a mapping from reference_id to chunk content
-                    ref_id_to_content = {}
-                    for chunk in chunks:
-                        ref_id = chunk.get("reference_id", "")
-                        content = chunk.get("content", "")
-                        if ref_id and content:
-                            # Collect chunk content
-                            ref_id_to_content.setdefault(ref_id, []).append(content)
-
-                    # Add content to references
-                    enriched_references = []
-                    for ref in references:
-                        ref_copy = ref.copy()
-                        ref_id = ref.get("reference_id", "")
-                        if ref_id in ref_id_to_content:
-                            # Keep content as a list of chunks (one file may have multiple chunks)
-                            ref_copy["content"] = ref_id_to_content[ref_id]
-                        enriched_references.append(ref_copy)
-                    references = enriched_references
+                    references = _enrich_references_with_chunks(
+                        references, data.get("chunks", [])
+                    )
 
                 if llm_response.get("is_streaming"):
                     response_stream = llm_response.get("response_iterator")
-                    if response_stream:
+                    if response_stream and request.include_references:
+                        response_parts = []
                         try:
-                            if request.include_references:
-                                response_parts: list[str] = []
-                                async for chunk in response_stream:
-                                    if chunk:
-                                        response_parts.append(chunk)
-                                response_content = "".join(response_parts)
-                                response_content, references = _sync_response_references(
-                                    response_content, references
-                                )
-                                yield f"{json.dumps({'references': references})}\n"
-                                if response_content:
-                                    yield f"{json.dumps({'response': response_content})}\n"
-                            else:
-                                async for chunk in response_stream:
-                                    if chunk:  # Only send non-empty content
-                                        yield f"{json.dumps({'response': chunk})}\n"
+                            async for chunk in response_stream:
+                                if chunk:
+                                    response_parts.append(chunk)
+                        except Exception as e:
+                            logger.error(f"Streaming error: {str(e)}")
+                            yield f"{json.dumps({'error': str(e)})}\n"
+                            return
+
+                        response_content = "".join(response_parts)
+                        if not response_content:
+                            response_content = "No relevant context found for the query."
+                        response_content, references = _sync_response_references(
+                            response_content, references
+                        )
+
+                        yield f"{json.dumps({'references': references})}\n"
+                        yield f"{json.dumps({'response': response_content})}\n"
+                    elif response_stream:
+                        try:
+                            async for chunk in response_stream:
+                                if chunk:  # Only send non-empty content
+                                    yield f"{json.dumps({'response': chunk})}\n"
                         except Exception as e:
                             logger.error(f"Streaming error: {str(e)}")
                             yield f"{json.dumps({'error': str(e)})}\n"
@@ -783,9 +776,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     if not response_content:
                         response_content = "No relevant context found for the query."
 
-                    response_content, references = _sync_response_references(
-                        response_content, references
-                    )
+                    if request.include_references:
+                        response_content, references = _sync_response_references(
+                            response_content, references
+                        )
 
                     # Create complete response object
                     complete_response = {"response": response_content}

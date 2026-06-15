@@ -4,71 +4,34 @@ services:
       - ./lightrag/operate.py:/app/lightrag/operate.py
       - ./lightrag/api/config.py:/app/lightrag/api/config.py
       - ./lightrag/api/lightrag_server.py:/app/lightrag/api/lightrag_server.py
+      - ./lightrag/api/routers/query_routes_runtime.py:/app/lightrag/api/routers/query_routes.py
 
-  vllm-embed:
-    image: vllm/vllm-openai:latest
-    runtime: nvidia
-    command: >
-      Qwen/Qwen3-Embedding-0.6B
-      --runner pooling
-      --convert embed
-      --port 8001
-      --dtype float16
-      --max-model-len 8192
-      --gpu-memory-utilization 0.43
-    environment:
-      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
-      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+  model-api:
+    build:
+      context: ./model_service
+      dockerfile: Dockerfile.cpu
     ports:
       - "8001:8001"
     volumes:
-      - ./data/hf-cache:/root/.cache/huggingface
-    ipc: host
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - 'PORT_HEX="$(printf ''%04X'' 8001)"; cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -q ":$${PORT_HEX} "'
-      interval: 5s
-      timeout: 3s
-      retries: 120
-      start_period: 10s
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-
-  vllm-rerank:
-    image: vllm/vllm-openai:latest
-    runtime: nvidia
-    command: >
-      BAAI/bge-reranker-v2-m3
-      --port 8000
-      --dtype float16
-      --max-model-len 8192
-      --gpu-memory-utilization 0.38
+      - ./data/hf-cache:/models/hf-cache
     environment:
-      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
-      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./data/hf-cache:/root/.cache/huggingface
-    ipc: host
+      HF_HOME: /models/hf-cache
+      SENTENCE_TRANSFORMERS_HOME: /models/hf-cache/sentence-transformers
+      TRANSFORMERS_CACHE: /models/hf-cache/transformers
+      HF_HUB_DISABLE_XET: "1"
+      MODEL_DEVICE: cpu
+      EMBEDDING_MODEL: Qwen/Qwen3-Embedding-0.6B
+      RERANK_MODEL: BAAI/bge-reranker-v2-m3
+      EMBED_BATCH_SIZE: "4"
+      RERANK_BATCH_SIZE: "4"
+      MODEL_MAX_LENGTH: "8192"
     healthcheck:
       test:
-        - CMD-SHELL
-        - 'PORT_HEX="$(printf ''%04X'' 8000)"; cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -q ":$${PORT_HEX} "'
-      interval: 5s
-      timeout: 3s
-      retries: 120
-      start_period: 10s
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3).read()"
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 120s

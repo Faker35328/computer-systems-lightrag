@@ -8,10 +8,10 @@
 - API 文档: `http://localhost:9621/docs`
 - 当前工作区: `course_qwen36_plus_qwen3emb06b_courseware_v1`
 - LLM: `qwen3.7-plus`
-- Embedding: 本地 vLLM `Qwen/Qwen3-Embedding-0.6B`
+- Embedding: CPU 版 Python FastAPI `Qwen/Qwen3-Embedding-0.6B`
 - Embedding 服务: `http://localhost:8001/v1`
-- Reranker: 本地 vLLM `BAAI/bge-reranker-v2-m3`
-- Reranker 服务: `http://localhost:8000/rerank`
+- Reranker: CPU 版 Python FastAPI `BAAI/bge-reranker-v2-m3`
+- Reranker 服务: `http://localhost:8001/rerank`
 - 向量维度: `1024`
 - 切分策略: `recursive_character`
 - 存储: LightRAG 默认本地存储，`NanoVectorDBStorage` + `NetworkXStorage`
@@ -30,25 +30,25 @@
 
 ### 2. 本地 Qwen3-Embedding-0.6B 嵌入模型
 
-新增 vLLM embedding 服务，负责提供 OpenAI-compatible `/v1/embeddings`：
+新增 CPU 版 Python FastAPI embedding 服务，负责提供 OpenAI-compatible `/v1/embeddings`：
 
-- 容器服务名: `vllm-embed`
-- 容器内地址: `http://vllm-embed:8001/v1`
+- 容器服务名: `model-api`
+- 容器内地址: `http://model-api:8001/v1`
 - 宿主机地址: `http://localhost:8001/v1`
 - 模型: `Qwen/Qwen3-Embedding-0.6B`
 - 维度: `1024`
 - 当前服务上下文长度: `8192`
 - Hugging Face 缓存目录: `HKUDS-LightRAG/data/hf-cache`
 
-LightRAG 通过 Docker 网络访问 `vllm-embed:8001`，宿主机和调试脚本通过 `localhost:8001` 访问。
+LightRAG 通过 Docker 网络访问 `model-api:8001`，宿主机和调试脚本通过 `localhost:8001` 访问。
 
 ### 3. 本地 reranker 重排序模型
 
-新增 vLLM rerank 服务，负责提供 Cohere-compatible `/rerank` 接口：
+同一个 CPU 版 Python FastAPI 服务也负责提供 Cohere-compatible `/rerank` 接口：
 
-- 容器服务名: `vllm-rerank`
-- 容器内地址: `http://vllm-rerank:8000/rerank`
-- 宿主机地址: `http://localhost:8000/rerank`
+- 容器服务名: `model-api`
+- 容器内地址: `http://model-api:8001/rerank`
+- 宿主机地址: `http://localhost:8001/rerank`
 - 模型: `BAAI/bge-reranker-v2-m3`
 - 默认策略: 服务常驻，但 `RERANK_BY_DEFAULT=false`
 
@@ -62,19 +62,26 @@ LightRAG 通过 Docker 网络访问 `vllm-embed:8001`，宿主机和调试脚本
 }
 ```
 
-8GB 显卡下采用保守显存分配，并把两个 vLLM 服务的 `--max-model-len` 都控制在 `8192`：
+CPU 版服务不依赖 NVIDIA runtime，也不需要拉取 `vllm/vllm-openai` 大镜像。默认批大小较保守：
 
 ```text
-vllm-embed   gpu-memory-utilization = 0.43
-vllm-rerank  gpu-memory-utilization = 0.38
+EMBED_BATCH_SIZE=4
+RERANK_BATCH_SIZE=4
+MODEL_MAX_LENGTH=8192
+HF_HUB_DISABLE_XET=1
 ```
 
-当前已完成验证：
+`HF_HUB_DISABLE_XET=1` 用于避开 Hugging Face Xet 下载在部分网络环境下长时间卡住的问题，模型文件仍然缓存到 `HKUDS-LightRAG/data/hf-cache`。
 
-- `http://localhost:8000/rerank` 可正常返回排序分数。
-- 示例问题 `空间局部性是什么？` 中，相关文本得分约 `0.9985`，不相关文本得分约 `0.00017`。
-- LightRAG `/health` 已显示 `rerank_binding=cohere`、`rerank_model=BAAI/bge-reranker-v2-m3`。
-- `/query/data` 使用 `enable_rerank=true` 时，LightRAG 日志中出现 `Successfully reranked: 8 chunks from 44 original chunks`，说明不是只启动了容器，而是已经实际参与检索排序。
+切换到 CPU 服务后，推荐按下面几项验证：
+
+- `http://localhost:8001/health` 显示 embedding 和 rerank 模型均已加载。
+- `http://localhost:8001/v1/embeddings` 对短文本返回 `1024` 维向量。
+- `http://localhost:8001/rerank` 对相关/不相关文本返回可区分的排序分数。
+- LightRAG `/health` 显示 `rerank_binding=cohere`、`rerank_model=BAAI/bge-reranker-v2-m3`。
+- `/query/data` 使用 `enable_rerank=true` 时，LightRAG 日志中应出现类似 `Successfully reranked: ... chunks from ... original chunks` 的记录，说明 reranker 已实际参与检索排序。
+
+CPU 版部署的代价是查询和批量入库速度会慢于 vLLM/GPU 方案；如果响应太慢，可以降低 `top_k`、`chunk_top_k`，并保持 `RERANK_BY_DEFAULT=false`，只在疑难问题中按需开启重排序。
 
 ### 4. LLM 切换到 qwen3.7-plus
 
@@ -258,7 +265,8 @@ metadata.course_outline_enhancer
 ├─ HKUDS-LightRAG/                         # LightRAG Docker 项目与配置
 │  ├─ .env                                 # 本地环境变量，包含密钥，不要提交
 │  ├─ docker-compose.yml
-│  ├─ docker-compose.embedding.yml         # vLLM embedding 增量 compose
+│  ├─ docker-compose.embedding.yml         # CPU 模型服务增量 compose
+│  ├─ model_service/                       # embedding / rerank FastAPI 服务
 │  ├─ course_outlines/                     # 课程 JSON 骨架，用于查询阶段关键词增强
 │  └─ data/hf-cache/                       # Hugging Face 模型缓存
 ├─ 知识库/                                  # 原始课程 PDF
@@ -307,7 +315,7 @@ LLM_MODEL=qwen3.7-plus
 OPENAI_LLM_EXTRA_BODY='{"enable_thinking": false}'
 
 EMBEDDING_BINDING=openai
-EMBEDDING_BINDING_HOST=http://vllm-embed:8001/v1
+EMBEDDING_BINDING_HOST=http://model-api:8001/v1
 EMBEDDING_BINDING_API_KEY=local-key
 EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B
 EMBEDDING_DIM=1024
@@ -322,7 +330,7 @@ EMBEDDING_DOCUMENT_PREFIX=NO_PREFIX
 
 RERANK_BINDING=cohere
 RERANK_MODEL=BAAI/bge-reranker-v2-m3
-RERANK_BINDING_HOST=http://vllm-rerank:8000/rerank
+RERANK_BINDING_HOST=http://model-api:8001/rerank
 RERANK_BINDING_API_KEY=local-key
 RERANK_BY_DEFAULT=false
 MIN_RERANK_SCORE=0.0
@@ -346,22 +354,24 @@ MAX_PARALLEL_INSERT=3
 
 不要把真实的阿里云 API Key 写进 README 或提交到 Git。
 
-### 2. 启动 vLLM embedding / reranker 和 LightRAG
+### 2. 启动 CPU 模型服务和 LightRAG
 
 ```powershell
 cd D:\work-space\light-RAG\HKUDS-LightRAG
 
-docker compose -f docker-compose.yml -f docker-compose.embedding.yml up -d vllm-embed vllm-rerank
+docker compose -f docker-compose.yml -f docker-compose.embedding.yml up -d model-api
 docker compose -f docker-compose.yml -f docker-compose.embedding.yml up -d lightrag
 ```
 
+第一次构建 `model-api` 会下载 CPU 版 PyTorch、Transformers、SentenceTransformers 依赖，以及两个 Hugging Face 模型。请确保 Docker 数据目录和 `HKUDS-LightRAG/data/hf-cache` 位于空间充足的数据盘。
+
 ### 3. 验证服务
 
-验证 vLLM：
+验证模型服务：
 
 ```powershell
+Invoke-RestMethod -Uri "http://localhost:8001/health"
 Invoke-RestMethod -Uri "http://localhost:8001/v1/models"
-Invoke-RestMethod -Uri "http://localhost:8000/v1/models"
 ```
 
 验证 LightRAG：
@@ -381,7 +391,7 @@ Invoke-RestMethod -Uri "http://localhost:9621/documents/status_counts"
 ```powershell
 cd D:\work-space\light-RAG\HKUDS-LightRAG
 
-docker compose -f docker-compose.yml -f docker-compose.embedding.yml logs --tail 100 vllm-embed
+docker compose -f docker-compose.yml -f docker-compose.embedding.yml logs --tail 100 model-api
 docker compose -f docker-compose.yml -f docker-compose.embedding.yml logs --tail 100 lightrag
 ```
 
@@ -623,7 +633,7 @@ metadata.processing_info
 LangChain Agent
  -> HTTP
  -> LightRAG Server
- -> vLLM Embedding + qwen3.7-plus
+ -> CPU FastAPI Embedding/Rerank + qwen3.7-plus
  -> 本地知识库
 ```
 
@@ -843,7 +853,7 @@ Instruct: Given a Computer Systems course learning question, retrieve relevant t
 Query: 空间局部性是什么？
 ```
 
-这段文本会被本地 vLLM 的 `Qwen/Qwen3-Embedding-0.6B` 转成 `1024` 维向量，然后去 `chunks_vdb` 里找语义最相似的课件/教材/手册文本块。
+这段文本会被本地 CPU FastAPI 模型服务中的 `Qwen/Qwen3-Embedding-0.6B` 转成 `1024` 维向量，然后去 `chunks_vdb` 里找语义最相似的课件/教材/手册文本块。
 
 本例中 `/query/data` 返回的文本块示例：
 
@@ -863,16 +873,31 @@ chunk 3:
 
 ### 5. 关键词驱动的图谱检索
 
-除了直接查文本块，LightRAG 还会用关键词查图谱：
+除了直接查文本块，LightRAG 还会用关键词查图谱。这里要区分三类对象：
+
+| 对象 | 来自哪里 | 主要作用 | 是否直接等同于最终正文依据 |
+| --- | --- | --- | --- |
+| 文本 chunk | `chunks_vdb` | 原始课件页、教材小节、手册小节的文本片段 | 是，最终上下文的主要材料 |
+| 实体 entity | `entities_vdb` | 命中相关概念，并扩展它的邻居关系和来源 chunk | 不是完整正文，主要是检索线索 |
+| 关系 relationship | `relationships_vdb` | 命中主题层面的概念关系，并回溯关系来源 chunk | 不是完整正文，主要是检索线索 |
+
+更准确的流程是：
 
 ```text
 low_level keywords
  -> entities_vdb
- -> 找到相关实体及其邻域关系
+ -> 向量检索命中相关实体
+ -> 从本地图谱中取实体邻居、相关关系
+ -> 根据实体/关系记录的 source_id 或 file_path 回溯原始 chunk
 
 high_level keywords
  -> relationships_vdb
- -> 找到主题层面的相关关系
+ -> 向量检索命中主题相关关系
+ -> 根据关系两端实体和关系来源回溯原始 chunk
+
+原始问题
+ -> chunks_vdb
+ -> 直接命中语义相似的原始文本 chunk
 ```
 
 本例 `/query/data` 的统计信息：
@@ -886,7 +911,9 @@ high_level keywords
 }
 ```
 
-命中的实体示例：
+这里的 `entities=17` 表示命中了 17 个实体线索，`relationships=91` 表示命中了或扩展出了 91 条关系线索；它们不等于 17 段或 91 段正文。`chunks=8` 才是最终主要进入上下文的原始文本块数量，`references=8` 是这些文本块对应的来源数量。
+
+命中的实体线索示例：
 
 ```json
 {
@@ -897,7 +924,7 @@ high_level keywords
 }
 ```
 
-命中的关系示例：
+命中的关系线索示例：
 
 ```json
 {
@@ -909,14 +936,22 @@ high_level keywords
 }
 ```
 
+这条关系说明“空间局部性”和“高速缓存”在知识图谱中有关联，但 LightRAG 通常不会只把这段关系 JSON 当作最终答案材料。它会进一步根据关系的来源信息，回到原始课件页或教材小节，例如：
+
+```text
+计算机系统基础1：14. 高速缓存.pdf 第 20 页
+```
+
+然后把该来源对应的原始 chunk 加入候选上下文。也就是说，实体和关系更像“检索路由”和“语义扩展线索”；最终喂给 LLM 的核心材料仍然是原始文档 chunk，以及经过整理的实体/关系摘要信息。
+
 ### 6. 合并、去重和 token budget 截断
 
 LightRAG 会把三路召回结果合并：
 
 ```text
-文本块召回结果
-+ 实体召回结果
-+ 关系召回结果
+chunks_vdb 直接命中的原始 chunk
++ entities_vdb 命中的实体线索扩展出的 chunk
++ relationships_vdb 命中的关系线索扩展出的 chunk
 ```
 
 然后按配置中的 token budget 控制最终上下文大小：
@@ -958,7 +993,7 @@ max_total_tokens
 
 ```text
 model = BAAI/bge-reranker-v2-m3
-endpoint = http://vllm-rerank:8000/rerank
+endpoint = http://model-api:8001/rerank
 ```
 
 它会对候选 chunks 计算“问题-文档”相关性分数，并按分数重新排序。实际验证时，LightRAG 日志出现过：
@@ -1000,7 +1035,7 @@ Successfully reranked: 8 chunks from 44 original chunks
 LightRAG 内部会把这些候选内容转换成 Cohere-compatible rerank 请求，发送给容器内服务：
 
 ```http
-POST http://vllm-rerank:8000/rerank
+POST http://model-api:8001/rerank
 ```
 
 请求体逻辑上类似：
@@ -1060,7 +1095,7 @@ POST http://vllm-rerank:8000/rerank
 5. 计算机系统基础1：13. 存储器层次结构.pdf 第 58 页
 ```
 
-注意：当前 `/query/data` 主要展示重排后的 chunks 和 references，不一定直接暴露每条 chunk 的 `rerank_score`。如果要看分数，可以直接调用 `http://localhost:8000/rerank` 做小规模验证；如果要看 LightRAG 是否调用成功，则查看容器日志中的 `Successfully reranked...`。
+注意：当前 `/query/data` 主要展示重排后的 chunks 和 references，不一定直接暴露每条 chunk 的 `rerank_score`。如果要看分数，可以直接调用 `http://localhost:8001/rerank` 做小规模验证；如果要看 LightRAG 是否调用成功，则查看容器日志中的 `Successfully reranked...`。
 
 如果 `enable_rerank=false` 或不传该字段，则跳过这一步，仍使用 LightRAG 原本的向量相似度、图谱关联和内部合并排序。
 
